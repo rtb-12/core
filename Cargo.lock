@@ -5995,6 +5995,7 @@ version = "0.6.0"
 dependencies = [
  "bs58 0.5.1",
  "calimero-config",
+ "calimero-context-config",
  "calimero-primitives",
  "calimero-server-primitives",
  "camino",
@@ -6016,6 +6017,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite 0.24.0",
+ "toml",
  "url",
 ]
 

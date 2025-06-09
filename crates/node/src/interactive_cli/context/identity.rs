@@ -1,11 +1,12 @@
 use std::pin::pin;
 
+use calimero_context_config::types::Capability as ConfigCapability;
 use calimero_context_primitives::client::ContextClient;
 use calimero_node_primitives::client::NodeClient;
 use calimero_primitives::alias::Alias;
 use calimero_primitives::context::ContextId;
 use calimero_primitives::identity::PublicKey;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use eyre::{OptionExt, Result as EyreResult, WrapErr};
 use futures_util::TryStreamExt;
 use owo_colors::OwoColorize;
@@ -49,6 +50,46 @@ enum ContextIdentitySubcommands {
         )]
         force: bool,
     },
+    #[command(about = "Grant permissions to a member")]
+    Grant {
+        #[arg(long, short, default_value = "default")]
+        context: Alias<ContextId>,
+        #[arg(long = "as", default_value = "default")]
+        granter: Alias<PublicKey>,
+        #[arg(help = "The member to grant permissions to")]
+        grantee: Alias<PublicKey>,
+        #[arg(help = "The capability to grant")]
+        capability: Capability,
+    },
+    #[command(about = "Revoke permissions from a member")]
+    Revoke {
+        #[arg(long, short, default_value = "default")]
+        context: Alias<ContextId>,
+        #[arg(long = "as", default_value = "default")]
+        revoker: Alias<PublicKey>,
+        #[arg(help = "The member to revoke permissions from")]
+        revokee: Alias<PublicKey>,
+        #[arg(help = "The capability to revoke")]
+        capability: Capability,
+    },
+}
+
+#[derive(Debug, Clone, ValueEnum, Copy)]
+#[clap(rename_all = "PascalCase")]
+pub enum Capability {
+    ManageApplication,
+    ManageMembers,
+    Proxy,
+}
+
+impl From<Capability> for ConfigCapability {
+    fn from(value: Capability) -> Self {
+        match value {
+            Capability::ManageApplication => ConfigCapability::ManageApplication,
+            Capability::ManageMembers => ConfigCapability::ManageMembers,
+            Capability::Proxy => ConfigCapability::Proxy,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,9 +122,10 @@ enum ContextIdentityAliasSubcommands {
     #[command(about = "Resolve the alias to a context identity")]
     Get {
         /// Name of the alias to look up
+        #[arg(default_value = "default")]
         identity: Alias<PublicKey>,
         /// The context that the identity is a member of
-        #[arg(long, short)]
+        #[arg(long, short, default_value = "default")]
         context: Alias<ContextId>,
     },
     #[command(about = "List context identity aliases", alias = "ls")]
@@ -118,7 +160,7 @@ impl ContextIdentityCommand {
                     .ok_or_eyre("unable to resolve context")?;
 
                 let identity_id = node_client
-                    .lookup_alias(identity, Some(context_id))?
+                    .resolve_alias(identity, Some(context_id))?
                     .ok_or_eyre("unable to resolve identity")?;
 
                 let default_alias: Alias<PublicKey> = "default"
@@ -130,7 +172,7 @@ impl ContextIdentityCommand {
                 {
                     if existing_identity == identity_id {
                         println!(
-                            "{} Default identity already set to: {} for context {}",
+                            "{} Default identity already set to: '{}' for context '{}'",
                             ind,
                             identity.cyan(),
                             context_id.cyan()
@@ -154,12 +196,77 @@ impl ContextIdentityCommand {
                     node_client.delete_alias(default_alias, Some(context_id))?;
                 }
 
+                node_client.create_alias(default_alias, Some(context_id), identity_id)?;
+
                 println!(
-                    "{} Default identity set to: {} for context {}",
+                    "{} Default identity set to: '{}' for context '{}'",
                     ind,
                     identity.cyan(),
                     context_id.cyan()
                 );
+            }
+
+            ContextIdentitySubcommands::Grant {
+                context,
+                granter,
+                grantee,
+                capability,
+            } => {
+                let context_id = node_client
+                    .resolve_alias(context, None)?
+                    .ok_or_eyre("unable to resolve context")?;
+
+                let granter_id = node_client
+                    .resolve_alias(granter, Some(context_id))?
+                    .ok_or_eyre("unable to resolve granter identity")?;
+
+                let grantee_id = node_client
+                    .resolve_alias(grantee, Some(context_id))?
+                    .ok_or_eyre("unable to resolve revokee identity")?;
+
+                let config_client = ctx_client
+                    .context_config(&context_id)?
+                    .ok_or_else(|| eyre::eyre!("context '{}' does not exist", context_id))?;
+
+                let external_client = ctx_client.external_client(&context_id, &config_client)?;
+
+                external_client
+                    .config()
+                    .grant(&granter_id, &[(grantee_id, capability.into())])
+                    .await?;
+
+                println!("{ind} Permission granted successfully");
+            }
+            ContextIdentitySubcommands::Revoke {
+                context,
+                revoker,
+                revokee,
+                capability,
+            } => {
+                let context_id = node_client
+                    .resolve_alias(context, None)?
+                    .ok_or_eyre("unable to resolve context")?;
+
+                let revoker_id = node_client
+                    .resolve_alias(revoker, Some(context_id))?
+                    .ok_or_eyre("unable to resolve revoker identity")?;
+
+                let revokee_id = node_client
+                    .resolve_alias(revokee, Some(context_id))?
+                    .ok_or_eyre("unable to resolve revokee identity")?;
+
+                let config_client = ctx_client
+                    .context_config(&context_id)?
+                    .ok_or_else(|| eyre::eyre!("context '{}' does not exist", context_id))?;
+
+                let external_client = ctx_client.external_client(&context_id, &config_client)?;
+
+                external_client
+                    .config()
+                    .revoke(&revoker_id, &[(revokee_id, capability.into())])
+                    .await?;
+
+                println!("{ind} Permission revoked successfully");
             }
         }
 

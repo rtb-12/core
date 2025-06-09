@@ -29,9 +29,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-std", "macros"] }
 tokio-tungstenite.workspace = true
+toml.workspace = true
 url = { workspace = true, features = ["serde"] }
 
 calimero-config.workspace = true
+calimero-context-config.workspace = true
 calimero-primitives.workspace = true
 calimero-server-primitives.workspace = true
 
