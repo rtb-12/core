@@ -6,13 +6,13 @@ use calimero_server_primitives::admin::{
 };
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Color, Table};
-use eyre::{OptionExt, Result as EyreResult};
-use reqwest::Client;
+use eyre::{OptionExt, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cli::{ConnectionInfo, Environment};
-use crate::common::{do_request, make_request, resolve_alias, RequestType};
+use crate::cli::Environment;
+use crate::common::resolve_alias;
+use crate::connection::ConnectionInfo;
 use crate::output::Report;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,14 +31,14 @@ impl Report for ProposalDetailsResponse {
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Copy, Clone, Parser, Debug)]
 #[command(about = "Manage proposals within a context")]
 pub struct ProposalsCommand {
     #[command(subcommand)]
     pub command: ProposalsSubcommand,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Copy, Clone, Debug, Subcommand)]
 pub enum ProposalsSubcommand {
     #[command(about = "List all proposals in a context", alias = "ls")]
     List {
@@ -156,13 +156,8 @@ impl Report for GetProposalsResponse {
 }
 
 impl ProposalsCommand {
-    pub async fn run(&self, environment: &Environment) -> EyreResult<()> {
-        let connection = environment
-            .connection
-            .as_ref()
-            .ok_or_eyre("No connection configured")?;
-
-        let client = Client::new();
+    pub async fn run(&self, environment: &Environment) -> Result<()> {
+        let connection = environment.connection()?;
 
         match &self.command {
             ProposalsSubcommand::List {
@@ -170,46 +165,36 @@ impl ProposalsCommand {
                 offset,
                 limit,
             } => {
-                let context_id = resolve_alias(
-                    &connection.api_url,
-                    connection.auth_key.as_ref(),
-                    *context,
-                    None,
-                )
-                .await?
-                .value()
-                .cloned()
-                .ok_or_eyre("unable to resolve context")?;
+                let context_id = resolve_alias(connection, *context, None)
+                    .await?
+                    .value()
+                    .cloned()
+                    .ok_or_eyre("unable to resolve context")?;
 
                 let args = serde_json::json!({
                     "offset": offset,
                     "limit": limit
                 });
 
-                self.list_proposals(environment, connection, &client, context_id, args)
+                self.list_proposals(environment, connection, context_id, args)
                     .await
             }
             ProposalsSubcommand::View {
                 proposal_id,
                 context,
             } => {
-                let context_id = resolve_alias(
-                    &connection.api_url,
-                    connection.auth_key.as_ref(),
-                    *context,
-                    None,
-                )
-                .await?
-                .value()
-                .cloned()
-                .ok_or_eyre("unable to resolve context")?;
+                let context_id = resolve_alias(connection, *context, None)
+                    .await?
+                    .value()
+                    .cloned()
+                    .ok_or_eyre("unable to resolve context")?;
 
                 let proposal_response = self
-                    .get_proposal(connection, &client, context_id, proposal_id)
+                    .get_proposal(connection, context_id, proposal_id)
                     .await?;
 
                 let approvers_response = self
-                    .get_proposal_approvers_data(connection, &client, context_id, proposal_id)
+                    .get_proposal_approvers_data(connection, context_id, proposal_id)
                     .await?;
 
                 let combined_response = ProposalDetailsResponse {
@@ -226,24 +211,15 @@ impl ProposalsCommand {
     async fn get_proposal_approvers_data(
         &self,
         connection: &ConnectionInfo,
-        client: &Client,
         context_id: ContextId,
         proposal_id: &Hash,
-    ) -> EyreResult<GetProposalApproversResponse> {
-        let mut url = connection.api_url.clone();
-        url.set_path(&format!(
-            "admin-api/dev/contexts/{}/proposals/{}/approvals/users",
-            context_id, proposal_id
-        ));
-
-        let response = do_request::<(), GetProposalApproversResponse>(
-            client,
-            url,
-            None::<()>,
-            connection.auth_key.as_ref(),
-            RequestType::Get,
-        )
-        .await?;
+    ) -> Result<GetProposalApproversResponse> {
+        let response = connection
+            .get(&format!(
+                "admin-api/contexts/{}/proposals/{}/approvals/users",
+                context_id, proposal_id
+            ))
+            .await?;
 
         Ok(response)
     }
@@ -252,45 +228,32 @@ impl ProposalsCommand {
         &self,
         environment: &Environment,
         connection: &ConnectionInfo,
-        client: &Client,
         context_id: ContextId,
         args: Value,
-    ) -> EyreResult<()> {
-        let mut url = connection.api_url.clone();
-        url.set_path(&format!("admin-api/dev/contexts/{context_id}/proposals"));
+    ) -> Result<()> {
+        let response: GetProposalsResponse = connection
+            .post(
+                &format!("admin-api/contexts/{}/proposals", context_id),
+                args,
+            )
+            .await?;
 
-        make_request::<_, GetProposalsResponse>(
-            environment,
-            client,
-            url,
-            Some(args),
-            connection.auth_key.as_ref(),
-            RequestType::Post,
-        )
-        .await
+        environment.output.write(&response);
+        Ok(())
     }
 
     async fn get_proposal(
         &self,
         connection: &ConnectionInfo,
-        client: &Client,
         context_id: ContextId,
         proposal_id: &Hash,
-    ) -> EyreResult<GetProposalResponse> {
-        let mut url = connection.api_url.clone();
-        url.set_path(&format!(
-            "admin-api/dev/contexts/{}/proposals/{}",
-            context_id, proposal_id
-        ));
-
-        let response = do_request::<(), GetProposalResponse>(
-            client,
-            url,
-            None::<()>,
-            connection.auth_key.as_ref(),
-            RequestType::Get,
-        )
-        .await?;
+    ) -> Result<GetProposalResponse> {
+        let response = connection
+            .get(&format!(
+                "admin-api/contexts/{}/proposals/{}",
+                context_id, proposal_id
+            ))
+            .await?;
 
         Ok(response)
     }

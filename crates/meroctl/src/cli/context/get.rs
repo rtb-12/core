@@ -6,14 +6,13 @@ use calimero_server_primitives::admin::{
 };
 use clap::Parser;
 use comfy_table::{Cell, Color, Table};
-use eyre::{OptionExt, Result as EyreResult};
-use reqwest::Client;
+use eyre::{OptionExt, Result};
 
 use crate::cli::Environment;
-use crate::common::{make_request, resolve_alias, RequestType};
+use crate::common::resolve_alias;
 use crate::output::Report;
 
-#[derive(Parser, Debug)]
+#[derive(Copy, Clone, Parser, Debug)]
 #[command(about = "Fetch details about the context")]
 pub struct GetCommand {
     #[command(subcommand)]
@@ -27,7 +26,7 @@ pub struct GetCommand {
     pub context: Alias<ContextId>,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Copy, Clone, Debug, Parser)]
 pub enum GetSubcommand {
     #[command(about = "Get context information")]
     Info,
@@ -107,19 +106,10 @@ impl Report for GetContextIdentitiesResponse {
 }
 
 impl GetCommand {
-    pub async fn run(self, environment: &Environment) -> EyreResult<()> {
-        let connection = environment
-            .connection
-            .as_ref()
-            .ok_or_eyre("No connection configured")?;
+    pub async fn run(self, environment: &Environment) -> Result<()> {
+        let connection = environment.connection()?;
 
-        let resolve_response = resolve_alias(
-            &connection.api_url,
-            connection.auth_key.as_ref(),
-            self.context,
-            None,
-        )
-        .await?;
+        let resolve_response = resolve_alias(connection, self.context, None).await?;
 
         let context_id = resolve_response
             .value()
@@ -128,47 +118,25 @@ impl GetCommand {
 
         match self.command {
             GetSubcommand::Info => {
-                let mut url = connection.api_url.clone();
-                url.set_path(&format!("admin-api/dev/contexts/{}", context_id));
-                make_request::<_, GetContextResponse>(
-                    environment,
-                    &Client::new(),
-                    url,
-                    None::<()>,
-                    connection.auth_key.as_ref(),
-                    RequestType::Get,
-                )
-                .await
+                let response: GetContextResponse = connection
+                    .get(&format!("admin-api/contexts/{}", context_id))
+                    .await?;
+                environment.output.write(&response);
             }
             GetSubcommand::ClientKeys => {
-                let mut url = connection.api_url.clone();
-                url.set_path(&format!(
-                    "admin-api/dev/contexts/{}/client-keys",
-                    context_id
-                ));
-                make_request::<_, GetContextClientKeysResponse>(
-                    environment,
-                    &Client::new(),
-                    url,
-                    None::<()>,
-                    connection.auth_key.as_ref(),
-                    RequestType::Get,
-                )
-                .await
+                let response: GetContextClientKeysResponse = connection
+                    .get(&format!("admin-api/contexts/{}/client-keys", context_id))
+                    .await?;
+                environment.output.write(&response);
             }
             GetSubcommand::Storage => {
-                let mut url = connection.api_url.clone();
-                url.set_path(&format!("admin-api/dev/contexts/{}/storage", context_id));
-                make_request::<_, GetContextStorageResponse>(
-                    environment,
-                    &Client::new(),
-                    url,
-                    None::<()>,
-                    connection.auth_key.as_ref(),
-                    RequestType::Get,
-                )
-                .await
+                let response: GetContextStorageResponse = connection
+                    .get(&format!("admin-api/contexts/{}/storage", context_id))
+                    .await?;
+                environment.output.write(&response);
             }
         }
+
+        Ok(())
     }
 }

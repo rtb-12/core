@@ -1,21 +1,19 @@
 use calimero_primitives::application::ApplicationId;
 use calimero_server_primitives::admin::GetApplicationResponse;
 use clap::{Parser, ValueEnum};
-use eyre::{OptionExt, Result as EyreResult};
-use reqwest::Client;
+use eyre::Result;
 
 use crate::cli::Environment;
-use crate::common::{do_request, RequestType};
 use crate::output::Report;
 
-#[derive(Parser, Debug)]
+#[derive(Copy, Clone, Parser, Debug)]
 #[command(about = "Fetch application details")]
 pub struct GetCommand {
     #[arg(value_name = "APP_ID", help = "application_id of the application")]
     pub app_id: ApplicationId,
 }
 
-#[derive(ValueEnum, Debug, Clone)]
+#[derive(Copy, ValueEnum, Debug, Clone)]
 pub enum GetValues {
     Details,
 }
@@ -30,23 +28,12 @@ impl Report for GetApplicationResponse {
 }
 
 impl GetCommand {
-    pub async fn run(self, environment: &Environment) -> EyreResult<()> {
-        let connection = environment
-            .connection
-            .as_ref()
-            .ok_or_eyre("No connection configured")?;
+    pub async fn run(self, environment: &Environment) -> Result<()> {
+        let connection = environment.connection()?;
 
-        let mut url = connection.api_url.clone();
-        url.set_path(&format!("admin-api/dev/applications/{}", self.app_id));
-
-        let response: GetApplicationResponse = do_request(
-            &Client::new(),
-            url,
-            None::<()>,
-            connection.auth_key.as_ref(),
-            RequestType::Get,
-        )
-        .await?;
+        let response: GetApplicationResponse = connection
+            .get(&format!("admin-api/applications/{}", self.app_id))
+            .await?;
 
         environment.output.write(&response);
         Ok(())

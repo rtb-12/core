@@ -4,19 +4,17 @@ use calimero_primitives::context::ContextId;
 use calimero_primitives::identity::PublicKey;
 use calimero_server_primitives::admin::GetContextIdentitiesResponse;
 use clap::{Parser, ValueEnum};
-use eyre::{OptionExt, Result as EyreResult, WrapErr};
-use reqwest::Client;
+use eyre::{OptionExt, Result, WrapErr};
 
-use crate::cli::{ConnectionInfo, Environment};
-use crate::common::{
-    create_alias, delete_alias, lookup_alias, make_request, resolve_alias, RequestType,
-};
+use crate::cli::Environment;
+use crate::common::{create_alias, delete_alias, lookup_alias, resolve_alias};
+use crate::connection::ConnectionInfo;
 use crate::output::ErrorLine;
 
-mod alias;
-mod generate;
-mod grant;
-mod revoke;
+pub mod alias;
+pub mod generate;
+pub mod grant;
+pub mod revoke;
 
 #[derive(Debug, Clone, ValueEnum, Copy)]
 #[clap(rename_all = "PascalCase")]
@@ -36,14 +34,14 @@ impl From<Capability> for ConfigCapability {
     }
 }
 
-#[derive(Debug, Parser)]
+#[derive(Copy, Clone, Debug, Parser)]
 #[command(about = "Manage context identities")]
 pub struct ContextIdentityCommand {
     #[command(subcommand)]
     command: ContextIdentitySubcommand,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Copy, Clone, Debug, Parser)]
 pub enum ContextIdentitySubcommand {
     #[command(about = "List identities in a context", alias = "ls")]
     List {
@@ -72,11 +70,8 @@ pub enum ContextIdentitySubcommand {
 }
 
 impl ContextIdentityCommand {
-    pub async fn run(self, environment: &Environment) -> EyreResult<()> {
-        let connection = environment
-            .connection
-            .as_ref()
-            .ok_or_eyre("No connection configured")?;
+    pub async fn run(self, environment: &Environment) -> Result<()> {
+        let connection = environment.connection()?;
 
         match self.command {
             ContextIdentitySubcommand::List { context, owned } => {
@@ -90,13 +85,7 @@ impl ContextIdentityCommand {
                 context,
                 force,
             } => {
-                let resolve_response = resolve_alias(
-                    &connection.api_url,
-                    connection.auth_key.as_ref(),
-                    context,
-                    None,
-                )
-                .await?;
+                let resolve_response = resolve_alias(connection, context, None).await?;
 
                 let context_id = resolve_response
                     .value()
@@ -105,13 +94,8 @@ impl ContextIdentityCommand {
                 let default_alias: Alias<PublicKey> =
                     "default".parse().expect("'default' is a valid alias name");
 
-                let lookup_result = lookup_alias(
-                    &connection.api_url,
-                    connection.auth_key.as_ref(),
-                    default_alias,
-                    Some(context_id),
-                )
-                .await?;
+                let lookup_result =
+                    lookup_alias(connection, default_alias, Some(context_id)).await?;
 
                 if let Some(existing_identity) = lookup_result.data.value {
                     if existing_identity == identity {
@@ -133,24 +117,13 @@ impl ContextIdentityCommand {
                         "Overwriting existing default alias from '{}' to '{}'",
                         existing_identity, identity
                     )));
-                    let _ = delete_alias(
-                        &connection.api_url,
-                        connection.auth_key.as_ref(),
-                        default_alias,
-                        Some(context_id),
-                    )
-                    .await
-                    .wrap_err("Failed to delete existing default alias")?;
+                    let _ = delete_alias(connection, default_alias, Some(context_id))
+                        .await
+                        .wrap_err("Failed to delete existing default alias")?;
                 }
 
-                let res = create_alias(
-                    &connection.api_url,
-                    connection.auth_key.as_ref(),
-                    default_alias,
-                    Some(context_id),
-                    identity,
-                )
-                .await?;
+                let res =
+                    create_alias(connection, default_alias, Some(context_id), identity).await?;
 
                 environment.output.write(&res);
 
@@ -167,10 +140,9 @@ async fn list_identities(
     connection: &ConnectionInfo,
     context: Option<Alias<ContextId>>,
     owned: bool,
-) -> EyreResult<()> {
+) -> Result<()> {
     let resolve_response = resolve_alias(
-        &connection.api_url,
-        connection.auth_key.as_ref(),
+        connection,
         context.unwrap_or_else(|| "default".parse().expect("valid alias")),
         None,
     )
@@ -188,20 +160,13 @@ async fn list_identities(
     };
 
     let endpoint = if owned {
-        format!("admin-api/dev/contexts/{}/identities-owned", context_id)
+        format!("admin-api/contexts/{}/identities-owned", context_id)
     } else {
-        format!("admin-api/dev/contexts/{}/identities", context_id)
+        format!("admin-api/contexts/{}/identities", context_id)
     };
 
-    let mut url = connection.api_url.clone();
-    url.set_path(&endpoint);
-    make_request::<_, GetContextIdentitiesResponse>(
-        environment,
-        &Client::new(),
-        url,
-        None::<()>,
-        connection.auth_key.as_ref(),
-        RequestType::Get,
-    )
-    .await
+    let response: GetContextIdentitiesResponse = connection.get(&endpoint).await?;
+
+    environment.output.write(&response);
+    Ok(())
 }

@@ -6,16 +6,14 @@ use calimero_server_primitives::admin::{
 use camino::Utf8PathBuf;
 use clap::Parser;
 use comfy_table::{Cell, Color, Table};
-use eyre::{bail, OptionExt, Result as EyreResult};
+use eyre::{bail, Result};
 use notify::event::ModifyKind;
 use notify::{EventKind, RecursiveMode, Watcher};
-use reqwest::Client;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use url::Url;
 
 use crate::cli::Environment;
-use crate::common::{do_request, RequestType};
 use crate::output::{ErrorLine, InfoLine, Report};
 
 #[derive(Debug, Parser)]
@@ -50,7 +48,7 @@ impl Report for InstallApplicationResponse {
 }
 
 impl InstallCommand {
-    pub async fn run(self, environment: &Environment) -> EyreResult<()> {
+    pub async fn run(self, environment: &Environment) -> Result<()> {
         let _ignored = self.install_app(environment).await?;
         if self.watch {
             self.watch_app(environment).await?;
@@ -58,18 +56,8 @@ impl InstallCommand {
         Ok(())
     }
 
-    pub async fn install_app(&self, environment: &Environment) -> EyreResult<ApplicationId> {
-        let connection = environment
-            .connection
-            .as_ref()
-            .ok_or_eyre("No connection configured")?;
-
-        let mut url = connection.api_url.clone();
-        if self.path.is_some() {
-            url.set_path("admin-api/dev/install-dev-application");
-        } else {
-            url.set_path("admin-api/dev/install-application");
-        }
+    pub async fn install_app(&self, environment: &Environment) -> Result<ApplicationId> {
+        let connection = environment.connection()?;
 
         let metadata = self
             .metadata
@@ -77,45 +65,27 @@ impl InstallCommand {
             .map(|s| s.as_bytes().to_vec())
             .unwrap_or_default();
 
-        let request = if let Some(app_path) = self.path.as_ref() {
-            serde_json::to_value(InstallDevApplicationRequest::new(
-                app_path.canonicalize_utf8()?,
-                metadata,
-            ))?
+        let response = if let Some(app_path) = self.path.as_ref() {
+            let request =
+                InstallDevApplicationRequest::new(app_path.canonicalize_utf8()?, metadata);
+            connection
+                .post::<_, InstallApplicationResponse>("admin-api/install-dev-application", request)
+                .await?
         } else if let Some(app_url) = self.url.as_ref() {
-            serde_json::to_value(InstallApplicationRequest::new(
-                Url::parse(&app_url)?,
-                self.hash,
-                metadata,
-            ))?
+            let request =
+                InstallApplicationRequest::new(Url::parse(&app_url)?, self.hash, metadata);
+            connection
+                .post::<_, InstallApplicationResponse>("admin-api/install-application", request)
+                .await?
         } else {
             bail!("Either path or url must be provided");
         };
 
-        let response: Result<InstallApplicationResponse, _> = do_request(
-            &Client::new(),
-            url,
-            Some(request),
-            connection.auth_key.as_ref(),
-            RequestType::Post,
-        )
-        .await;
-
-        match response {
-            Ok(response) => {
-                environment.output.write(&response);
-                Ok(response.data.application_id)
-            }
-            Err(e) => {
-                environment
-                    .output
-                    .write(&ErrorLine(&format!("Install failed: {}", e)));
-                Err(e)
-            }
-        }
+        environment.output.write(&response);
+        Ok(response.data.application_id)
     }
 
-    pub async fn watch_app(&self, environment: &Environment) -> EyreResult<()> {
+    pub async fn watch_app(&self, environment: &Environment) -> Result<()> {
         let Some(path) = self.path.as_ref() else {
             bail!("The path must be provided");
         };

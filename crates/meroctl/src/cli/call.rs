@@ -7,11 +7,11 @@ use calimero_server_primitives::jsonrpc::{
 use clap::Parser;
 use comfy_table::{Cell, Color, Table};
 use const_format::concatcp;
-use eyre::{OptionExt, Result as EyreResult};
+use eyre::{OptionExt, Result};
 use serde_json::{json, Value};
 
 use crate::cli::Environment;
-use crate::common::{do_request, resolve_alias, RequestType};
+use crate::common::resolve_alias;
 use crate::output::Report;
 
 pub const EXAMPLES: &str = r"
@@ -80,36 +80,20 @@ impl Report for Response {
 }
 
 impl CallCommand {
-    pub async fn run(self, environment: &Environment) -> EyreResult<()> {
-        let connection = environment
-            .connection
-            .as_ref()
-            .ok_or_eyre("No connection configured")?;
+    pub async fn run(self, environment: &Environment) -> Result<()> {
+        let connection = environment.connection()?;
 
-        let resolve_response = resolve_alias(
-            &connection.api_url,
-            connection.auth_key.as_ref(),
-            self.context,
-            None,
-        )
-        .await?;
+        let resolve_response = resolve_alias(connection, self.context, None).await?;
         let context_id = resolve_response
             .value()
             .cloned()
             .ok_or_eyre("Failed to resolve context: no value found")?;
-        let executor = resolve_alias(
-            &connection.api_url,
-            connection.auth_key.as_ref(),
-            self.executor,
-            Some(context_id),
-        )
-        .await?
-        .value()
-        .cloned()
-        .ok_or_eyre("unable to resolve")?;
 
-        let mut url = connection.api_url.clone();
-        url.set_path("jsonrpc/dev");
+        let executor = resolve_alias(connection, self.executor, Some(context_id))
+            .await?
+            .value()
+            .cloned()
+            .ok_or_eyre("unable to resolve")?;
 
         let payload = RequestPayload::Execute(ExecutionRequest::new(
             context_id,
@@ -125,16 +109,7 @@ impl CallCommand {
             payload,
         );
 
-        let client = reqwest::Client::new();
-        let response: Response = do_request(
-            &client,
-            url,
-            Some(request),
-            connection.auth_key.as_ref(),
-            RequestType::Post,
-        )
-        .await?;
-
+        let response: Response = connection.post("jsonrpc", request).await?;
         environment.output.write(&response);
 
         Ok(())

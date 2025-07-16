@@ -8,23 +8,22 @@ use calimero_primitives::context::ContextId;
 use calimero_primitives::identity::PublicKey;
 use calimero_server_primitives::admin::{
     AliasKind, CreateAliasRequest, CreateAliasResponse, CreateApplicationIdAlias,
-    CreateContextIdAlias, CreateContextIdentityAlias, DeleteAliasResponse, LookupAliasResponse,
+    CreateContextIdAlias, CreateContextIdentityAlias, DeleteAliasResponse, ListAliasesResponse,
+    LookupAliasResponse,
 };
 use camino::Utf8Path;
-use chrono::Utc;
 use comfy_table::{Cell, Color, Table};
-use eyre::{bail, eyre, Result as EyreResult, WrapErr};
-use libp2p::identity::Keypair;
+use eyre::{bail, eyre, Result, WrapErr};
 use libp2p::multiaddr::Protocol;
 use libp2p::Multiaddr;
-use reqwest::{Client, Url};
+use reqwest::Url;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::cli::{ApiError, Environment};
+use crate::connection::ConnectionInfo;
 use crate::output::Report;
 
-pub fn multiaddr_to_url(multiaddr: &Multiaddr, api_path: &str) -> EyreResult<Url> {
+pub fn multiaddr_to_url(multiaddr: &Multiaddr, api_path: &str) -> Result<Url> {
     #[expect(clippy::wildcard_enum_match_arm, reason = "Acceptable here")]
     let (ip, port, scheme) = multiaddr.iter().fold(
         (None, None, None),
@@ -48,99 +47,7 @@ pub fn multiaddr_to_url(multiaddr: &Multiaddr, api_path: &str) -> EyreResult<Url
     Ok(url)
 }
 
-pub async fn do_request<I, O>(
-    client: &Client,
-    url: Url,
-    body: Option<I>,
-    keypair: Option<&Keypair>,
-    req_type: RequestType,
-) -> EyreResult<O>
-where
-    I: Serialize,
-    O: DeserializeOwned,
-{
-    let mut builder = match req_type {
-        RequestType::Get => client.get(url),
-        RequestType::Post => client.post(url).json(&body),
-        RequestType::Delete => client.delete(url),
-    };
-
-    // Only add authentication if keypair is provided
-    if let Some(keypair) = keypair {
-        let timestamp = Utc::now().timestamp().to_string();
-        let signature = keypair.sign(timestamp.as_bytes())?;
-
-        builder = builder
-            .header("X-Signature", bs58::encode(signature).into_string())
-            .header("X-Timestamp", timestamp);
-    }
-
-    let response = builder.send().await?;
-
-    if !response.status().is_success() {
-        bail!(ApiError {
-            status_code: response.status().as_u16(),
-            message: response
-                .text()
-                .await
-                .map_err(|e| eyre!("Failed to get response text: {e}"))?,
-        });
-    }
-
-    let result = response.json::<O>().await?;
-
-    Ok(result)
-}
-// pub async fn do_request<I, O>(
-//     client: &Client,
-//     url: Url,
-//     body: Option<I>,
-//     keypair: &Keypair,
-//     req_type: RequestType,
-// ) -> Result<O, ServerRequestError>
-// where
-//     I: Serialize,
-//     O: DeserializeOwned,
-// {
-//     let timestamp = Utc::now().timestamp().to_string();
-//     let signature = keypair
-//         .sign(timestamp.as_bytes())
-//         .map_err(|err| ServerRequestError::SigningError(err.to_string()))?;
-
-//     let mut builder = match req_type {
-//         RequestType::Get => client.get(url),
-//         RequestType::Post => client.post(url).json(&body),
-//         RequestType::Delete => client.delete(url),
-//     };
-
-//     builder = builder
-//         .header("X-Signature", bs58::encode(signature).into_string())
-//         .header("X-Timestamp", timestamp);
-
-//     let response = builder
-//         .send()
-//         .await
-//         .map_err(|err| ServerRequestError::ExecutionError(err.to_string()))?;
-
-//     if !response.status().is_success() {
-//         return Err(ServerRequestError::ApiError(ApiError {
-//             status_code: response.status().as_u16(),
-//             message: response
-//                 .text()
-//                 .await
-//                 .map_err(|err| ServerRequestError::DeserializeError(err.to_string()))?,
-//         }));
-//     }
-
-//     let result = response
-//         .json::<O>()
-//         .await
-//         .map_err(|err| ServerRequestError::DeserializeError(err.to_string()))?;
-
-//     return Ok(result);
-// }
-
-pub async fn load_config(home: &Utf8Path, node_name: &str) -> EyreResult<ConfigFile> {
+pub async fn load_config(home: &Utf8Path, node_name: &str) -> Result<ConfigFile> {
     let path = home.join(node_name);
 
     if !ConfigFile::exists(&path) {
@@ -154,7 +61,7 @@ pub async fn load_config(home: &Utf8Path, node_name: &str) -> EyreResult<ConfigF
     Ok(config)
 }
 
-pub fn fetch_multiaddr(config: &ConfigFile) -> EyreResult<&Multiaddr> {
+pub fn fetch_multiaddr(config: &ConfigFile) -> Result<&Multiaddr> {
     let Some(multiaddr) = config.network.server.listen.first() else {
         bail!("No address.")
     };
@@ -166,23 +73,6 @@ pub enum RequestType {
     Get,
     Post,
     Delete,
-}
-
-pub(crate) async fn make_request<I, O>(
-    environment: &Environment,
-    client: &Client,
-    url: Url,
-    request: Option<I>,
-    keypair: Option<&Keypair>,
-    request_type: RequestType,
-) -> EyreResult<()>
-where
-    I: Serialize,
-    O: DeserializeOwned + Report + Serialize,
-{
-    let response = do_request::<I, O>(client, url, request, keypair, request_type).await?;
-    environment.output.write(&response);
-    Ok(())
 }
 
 pub(crate) trait UrlFragment: ScopedAlias + AliasKind {
@@ -247,35 +137,28 @@ impl Report for CreateAliasResponse {
 }
 
 pub(crate) async fn create_alias<T>(
-    base_url: &Url,
-    keypair: Option<&Keypair>,
+    connection: &ConnectionInfo,
     alias: Alias<T>,
     scope: Option<T::Scope>,
     value: T,
-) -> EyreResult<CreateAliasResponse>
+) -> Result<CreateAliasResponse>
 where
-    T: ScopedAlias + UrlFragment + Serialize,
+    T: UrlFragment + Serialize,
     T::Value: Serialize,
 {
-    let prefix = "admin-api/dev/alias/create";
-
+    let prefix = "admin-api/alias/create";
     let kind = T::KIND;
-
     let scope =
         T::scoped(scope.as_ref()).map_or_else(Default::default, |scope| format!("/{}", scope));
-
-    let mut url = base_url.clone();
-    url.set_path(&format!("{prefix}/{kind}{scope}"));
 
     let body = CreateAliasRequest {
         alias,
         value: value.create(),
     };
 
-    let response: CreateAliasResponse =
-        do_request(&Client::new(), url, Some(body), keypair, RequestType::Post).await?;
-
-    Ok(response)
+    connection
+        .post(&format!("{prefix}/{kind}{scope}"), body)
+        .await
 }
 
 impl Report for DeleteAliasResponse {
@@ -288,52 +171,73 @@ impl Report for DeleteAliasResponse {
 }
 
 pub(crate) async fn delete_alias<T>(
-    base_url: &Url,
-    keypair: Option<&Keypair>,
+    connection: &ConnectionInfo,
     alias: Alias<T>,
     scope: Option<T::Scope>,
-) -> EyreResult<DeleteAliasResponse>
+) -> Result<DeleteAliasResponse>
 where
-    T: ScopedAlias + UrlFragment,
+    T: UrlFragment,
 {
-    let prefix = "admin-api/dev/alias/delete";
-
+    let prefix = "admin-api/alias/delete";
     let kind = T::KIND;
-
     let scope =
         T::scoped(scope.as_ref()).map_or_else(Default::default, |scope| format!("{}/", scope));
 
-    let mut url = base_url.clone();
-    url.set_path(&format!("{prefix}/{kind}/{scope}{alias}"));
+    connection
+        .post(&format!("{prefix}/{kind}/{scope}{alias}"), None::<()>)
+        .await
+}
 
-    let response: DeleteAliasResponse =
-        do_request(&Client::new(), url, None::<()>, keypair, RequestType::Post).await?;
+impl<T: fmt::Display> Report for ListAliasesResponse<T> {
+    fn report(&self) -> () {
+        let mut table = Table::new();
+        let _ = table.set_header(vec![
+            Cell::new("Value").fg(Color::Blue),
+            Cell::new("Alias").fg(Color::Blue),
+        ]);
 
-    Ok(response)
+        for (alias, value) in &self.data {
+            let _ = table.add_row(vec![
+                Cell::new(&value.to_string()),
+                Cell::new(alias.as_str()),
+            ]);
+        }
+
+        println!("{table}");
+    }
+}
+
+pub(crate) async fn list_aliases<T>(
+    connection: &ConnectionInfo,
+    scope: Option<T::Scope>,
+) -> Result<ListAliasesResponse<T>>
+where
+    T: Ord + UrlFragment + DeserializeOwned,
+{
+    let prefix = "admin-api/alias/list";
+    let kind = T::KIND;
+    let scope =
+        T::scoped(scope.as_ref()).map_or_else(Default::default, |scope| format!("/{}", scope));
+
+    connection.get(&format!("{prefix}/{kind}{scope}")).await
 }
 
 pub(crate) async fn lookup_alias<T>(
-    base_url: &Url,
-    keypair: Option<&Keypair>,
+    connection: &ConnectionInfo,
     alias: Alias<T>,
     scope: Option<T::Scope>,
-) -> EyreResult<LookupAliasResponse<T>>
+) -> Result<LookupAliasResponse<T>>
 where
-    T: ScopedAlias + UrlFragment + DeserializeOwned,
+    T: UrlFragment + DeserializeOwned,
 {
-    let prefix = "admin-api/dev/alias/lookup";
-
+    let prefix = "admin-api/alias/lookup";
     let kind = T::KIND;
-
     let scope =
         T::scoped(scope.as_ref()).map_or_else(Default::default, |scope| format!("{}/", scope));
 
-    let mut url = base_url.clone();
-    url.set_path(&format!("{prefix}/{kind}/{scope}{alias}"));
-
-    let response = do_request(&Client::new(), url, None::<()>, keypair, RequestType::Post).await?;
-
-    Ok(response)
+    connection
+        .post(&format!("{prefix}/{kind}/{scope}{alias}"), None::<()>)
+        .await
 }
 
 impl<T: fmt::Display> Report for LookupAliasResponse<T> {
@@ -400,15 +304,14 @@ impl<T: fmt::Display> Report for ResolveResponse<T> {
 }
 
 pub(crate) async fn resolve_alias<T>(
-    base_url: &Url,
-    keypair: Option<&Keypair>,
+    connection: &ConnectionInfo,
     alias: Alias<T>,
     scope: Option<T::Scope>,
-) -> EyreResult<ResolveResponse<T>>
+) -> Result<ResolveResponse<T>>
 where
-    T: ScopedAlias + UrlFragment + FromStr + DeserializeOwned,
+    T: UrlFragment + FromStr + DeserializeOwned,
 {
-    let value = lookup_alias(base_url, keypair, alias, scope).await?;
+    let value = lookup_alias(connection, alias.clone(), scope).await?;
 
     if value.data.value.is_some() {
         return Ok(ResolveResponse {

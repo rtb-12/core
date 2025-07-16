@@ -1,14 +1,12 @@
 use calimero_server_primitives::admin::ListApplicationsResponse;
 use clap::Parser;
 use comfy_table::{Cell, Color, Table};
-use eyre::{OptionExt, Result as EyreResult};
-use reqwest::Client;
+use eyre::Result;
 
 use crate::cli::Environment;
-use crate::common::{do_request, RequestType};
 use crate::output::Report;
 
-#[derive(Debug, Parser)]
+#[derive(Copy, Clone, Debug, Parser)]
 #[command(about = "List installed applications")]
 pub struct ListCommand;
 
@@ -49,23 +47,10 @@ impl Report for ListApplicationsResponse {
 }
 
 impl ListCommand {
-    pub async fn run(self, environment: &Environment) -> EyreResult<()> {
-        let connection = environment
-            .connection
-            .as_ref()
-            .ok_or_eyre("No connection configured")?;
+    pub async fn run(self, environment: &Environment) -> Result<()> {
+        let connection = environment.connection()?;
 
-        let mut url = connection.api_url.clone();
-        url.set_path("admin-api/dev/applications");
-
-        let response: ListApplicationsResponse = do_request(
-            &Client::new(),
-            url,
-            None::<()>,
-            connection.auth_key.as_ref(),
-            RequestType::Get,
-        )
-        .await?;
+        let response: ListApplicationsResponse = connection.get("admin-api/applications").await?;
 
         environment.output.write(&response);
 

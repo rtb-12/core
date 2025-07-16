@@ -1,14 +1,12 @@
 use calimero_server_primitives::admin::GetContextsResponse;
 use clap::Parser;
 use comfy_table::{Cell, Color, Table};
-use eyre::{OptionExt, Result as EyreResult};
-use reqwest::Client;
+use eyre::Result;
 
 use crate::cli::Environment;
-use crate::common::{do_request, RequestType};
 use crate::output::Report;
 
-#[derive(Debug, Parser)]
+#[derive(Copy, Clone, Debug, Parser)]
 #[command(about = "List all contexts")]
 pub struct ListCommand;
 
@@ -16,8 +14,7 @@ impl Report for GetContextsResponse {
     fn report(&self) {
         let mut table = Table::new();
         let _ = table.set_header(vec![
-            Cell::new("Contexts").fg(Color::Blue),
-            Cell::new("ID").fg(Color::Blue),
+            Cell::new("Context ID").fg(Color::Blue),
             Cell::new("Application ID").fg(Color::Blue),
         ]);
 
@@ -32,23 +29,10 @@ impl Report for GetContextsResponse {
 }
 
 impl ListCommand {
-    pub async fn run(self, environment: &Environment) -> EyreResult<()> {
-        let connection = environment
-            .connection
-            .as_ref()
-            .ok_or_eyre("No connection configured")?;
+    pub async fn run(self, environment: &Environment) -> Result<()> {
+        let connection = environment.connection()?;
 
-        let mut url = connection.api_url.clone();
-        url.set_path("admin-api/dev/contexts");
-
-        let response: GetContextsResponse = do_request(
-            &Client::new(),
-            url,
-            None::<()>,
-            connection.auth_key.as_ref(),
-            RequestType::Get,
-        )
-        .await?;
+        let response: GetContextsResponse = connection.get("admin-api/contexts").await?;
 
         environment.output.write(&response);
 

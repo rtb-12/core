@@ -1,29 +1,31 @@
 use std::process::ExitCode;
 
+use calimero_version::CalimeroVersion;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Color, Table};
 use const_format::concatcp;
-use eyre::{bail, Report as EyreReport, WrapErr};
-use libp2p::identity::Keypair;
+use eyre::{bail, OptionExt, Report as EyreReport, Result};
 use serde::{Serialize, Serializer};
 use thiserror::Error as ThisError;
 use url::Url;
 
 use crate::common::{fetch_multiaddr, load_config, multiaddr_to_url};
 use crate::config::Config;
+use crate::connection::ConnectionInfo;
 use crate::defaults;
 use crate::output::{Format, Output, Report};
 
 mod app;
-mod bootstrap;
+pub mod auth;
 mod call;
 mod context;
 mod node;
 mod peers;
+pub mod storage;
 
 use app::AppCommand;
-use bootstrap::BootstrapCommand;
+use auth::{authenticate_with_session_cache, check_authentication};
 use call::CallCommand;
 use context::ContextCommand;
 use node::NodeCommand;
@@ -31,18 +33,14 @@ use peers::PeersCommand;
 
 pub const EXAMPLES: &str = r"
   # List all applications
-  $ meroctl --node-name node1 app ls
-  # List all applications with custom destination config
-  $ meroctl  --home data --node-name node1 app ls
+  $ meroctl --node node1 app ls
 
   # List all contexts
-  $ meroctl --node-name node1 context ls
-  # List all contexts with custom destination config
-  $ meroctl --home data --node-name node1 context ls
+  $ meroctl --node node1 context ls
 ";
 
 #[derive(Debug, Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = CalimeroVersion::current_str(), about, long_about = None)]
 #[command(after_help = concatcp!(
     "Environment variables:\n",
     "  CALIMERO_HOME    Directory for config and data\n\n",
@@ -62,7 +60,6 @@ pub enum SubCommands {
     App(AppCommand),
     Context(ContextCommand),
     Call(CallCommand),
-    Bootstrap(BootstrapCommand),
     Peers(PeersCommand),
     #[command(subcommand)]
     Node(NodeCommand),
@@ -87,35 +84,21 @@ pub struct RootArgs {
     pub output_format: Format,
 }
 
-impl RootArgs {
-    pub const fn new(
-        home: Utf8PathBuf,
-        api: Option<Url>,
-        node: Option<String>,
-        output_format: Format,
-    ) -> Self {
-        Self {
-            home,
-            api,
-            node,
-            output_format,
-        }
-    }
-}
-
+#[derive(Debug)]
 pub struct Environment {
-    pub args: RootArgs,
     pub output: Output,
-    pub connection: Option<ConnectionInfo>,
+    connection: Option<ConnectionInfo>,
 }
 
 impl Environment {
-    pub const fn new(args: RootArgs, output: Output, connection: Option<ConnectionInfo>) -> Self {
-        Self {
-            args,
-            output,
-            connection,
-        }
+    pub const fn new(output: Output, connection: Option<ConnectionInfo>) -> Self {
+        Self { output, connection }
+    }
+
+    pub fn connection(&self) -> Result<&ConnectionInfo> {
+        self.connection
+            .as_ref()
+            .ok_or_eyre("No node selected: set default node by running `meroctl node use <node_name>` or use `--node` or `--api` to manually select a node")
     }
 }
 
@@ -123,24 +106,33 @@ impl RootCommand {
     pub async fn run(self) -> Result<(), CliError> {
         let output = Output::new(self.args.output_format);
 
-        let connection = match self.prepare_connection().await {
-            Ok(conn) => conn,
-            Err(err) => {
-                let err = CliError::Other(err);
-                output.write(&err);
-                return Err(err);
-            }
+        // Some commands don't require a connection (like node commands)
+        let needs_connection = match &self.action {
+            SubCommands::Node(_) => false,
+            _ => true,
         };
 
-        let environment = Environment::new(self.args, output, Some(connection));
+        let connection = if needs_connection {
+            match self.prepare_connection(output).await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    let err = CliError::Other(err);
+                    output.write(&err);
+                    return Err(err);
+                }
+            }
+        } else {
+            None
+        };
+
+        let environment = Environment::new(output, connection);
 
         let result = match self.action {
             SubCommands::App(application) => application.run(&environment).await,
             SubCommands::Context(context) => context.run(&environment).await,
             SubCommands::Call(call) => call.run(&environment).await,
-            SubCommands::Bootstrap(call) => call.run(&environment).await,
             SubCommands::Peers(peers) => peers.run(&environment).await,
-            SubCommands::Node(node) => node.run().await,
+            SubCommands::Node(node) => node.run(&environment).await,
         };
 
         if let Err(err) = result {
@@ -156,47 +148,53 @@ impl RootCommand {
         Ok(())
     }
 
-    async fn prepare_connection(&self) -> eyre::Result<ConnectionInfo> {
-        let connection = match (&self.args.node, &self.args.api) {
+    async fn prepare_connection(&self, output: Output) -> Result<Option<ConnectionInfo>> {
+        match (&self.args.node, &self.args.api) {
             (Some(node), None) => {
+                // Use specific node - first check if it's registered
                 let config = Config::load().await?;
 
-                if let Some(conn) = config.get_connection(node).await? {
-                    return Ok(conn);
+                if let Some(conn) = config.get_connection(node, output).await? {
+                    return Ok(Some(conn));
                 }
 
+                // Check if it's a local node at <home>/<node>
                 let config = load_config(&self.args.home, node).await?;
                 let multiaddr = fetch_multiaddr(&config)?;
                 let url = multiaddr_to_url(&multiaddr, "")?;
 
-                ConnectionInfo {
-                    api_url: url,
-                    auth_key: Some(config.identity),
-                }
+                // Even local nodes might require authentication - use session cache for unregistered nodes
+                let connection =
+                    authenticate_with_session_cache(&url, &format!("local node {}", node), output)
+                        .await?;
+                Ok(Some(connection))
             }
             (None, Some(api_url)) => {
-                let mut auth_key = None;
-
-                if let Ok(node_key) = std::env::var("MEROCTL_NODE_KEY") {
-                    let bytes = bs58::decode(node_key)
-                        .into_vec()
-                        .wrap_err("failed to decode node key from environment variable")?;
-
-                    let node_key = Keypair::from_protobuf_encoding(&bytes)
-                        .wrap_err("failed to decode node key from environment variable")?;
-
-                    auth_key = Some(node_key);
-                }
-
-                ConnectionInfo {
-                    api_url: api_url.clone(),
-                    auth_key,
-                }
+                // Use specific API URL - check session cache first, then authenticate if needed
+                let connection =
+                    authenticate_with_session_cache(api_url, &api_url.to_string(), output).await?;
+                Ok(Some(connection))
             }
-            _ => bail!("expected one of `--node` or `--api` to be set"),
-        };
+            (None, None) => {
+                // Try to use active node
+                let config = Config::load().await?;
 
-        Ok(connection)
+                if let Some(active_node_name) = &config.active_node {
+                    if let Some(conn) = config.get_connection(active_node_name, output).await? {
+                        return Ok(Some(conn));
+                    } else {
+                        bail!(
+                            "Active node '{}' not found. Please check your configuration.",
+                            active_node_name
+                        );
+                    }
+                }
+
+                // No active node set
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -246,9 +244,4 @@ where
     S: Serializer,
 {
     serializer.collect_seq(report.chain().map(|e| e.to_string()))
-}
-
-pub struct ConnectionInfo {
-    pub api_url: Url,
-    pub auth_key: Option<Keypair>,
 }
